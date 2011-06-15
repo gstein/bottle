@@ -971,10 +971,11 @@ class BaseRequest(DictMixin):
 
     @property
     def script_name(self):
-        ''' The initial portion of the URL's `path` that was removed by a higher level
-            (server or routing middleware) before the application was called. This
-            property returns an empty string, or a path with leading and tailing slashes.
-        '''
+        ''' The initial portion of the URL's `path` that was removed by a higher
+            level (server or routing middleware) before the application was
+            called. This property returns a path with leading and tailing
+            slashes or a single slash even if the original `SCRIPT_PATH` was
+            empty. '''
         script_name = self.environ.get('SCRIPT_NAME', '').strip('/')
         return '/' + script_name + '/' if script_name else '/'
 
@@ -1775,6 +1776,10 @@ class ServerAdapter(object):
 
     def run(self, handler): # pragma: no cover
         pass
+        
+    def shutdown(self):
+        ''' Stop the server. This is only implemented for some of the adapters.
+        '''
 
     def __repr__(self):
         args = ', '.join(['%s=%s'%(k,repr(v)) for k, v in self.options.items()])
@@ -1797,14 +1802,15 @@ class FlupFCGIServer(ServerAdapter):
 
 
 class WSGIRefServer(ServerAdapter):
+    ''' A simple single-threaded development server. '''
     def run(self, handler): # pragma: no cover
         from wsgiref.simple_server import make_server, WSGIRequestHandler
         if self.quiet:
             class QuietHandler(WSGIRequestHandler):
                 def log_request(*args, **kw): pass
             self.options['handler_class'] = QuietHandler
-        srv = make_server(self.host, self.port, handler, **self.options)
-        srv.serve_forever()
+        self.server = make_server(self.host, self.port, handler, **self.options)
+        self.server.serve_forever()
 
 
 class CherryPyServer(ServerAdapter):
@@ -1959,6 +1965,118 @@ class AutoServer(ServerAdapter):
                 pass
 
 
+class ReloadingServer(WSGIRefServer):
+    ''' A development server that restarts itself on modified module files.
+
+        The main process acts as an observer that starts the actual HTTP server
+        in a sub-process and restarts the server if needed.
+
+        Please note that any module-level code is executed twice at startup and
+        once again for each reload. Also, starting sub-processes seems to
+        confuse some debuggers. You can check for the `BOTTLE_CHILD` variable in
+        :data:`os.environ` at runtime to guard critical code.
+
+        On windows, things get messy. It works most of the time, but sometimes
+        processes hang or other oddities happen. I could never reproduce these
+        errors. Sorry for that.
+
+        Ctrl-C should terminate both processes. If not (windows again), kill one
+        of them and the other should follow within 10 seconds.
+    '''
+
+    #: Number of seconds a sub-process survives without an observer-heartbeat.
+    timeout = 10
+
+    #: Number of seconds between two heartbeats and file-modification-checks.
+    interval = 1
+    
+    def run(self, handler):
+        is_child = 'BOTTLE_CHILD' in os.environ
+        self.run_server(handler) if is_child else self.run_observer()
+
+    def run_observer(self):
+        ''' Run the observer loop that starts and restarts the server-process
+            as needed. '''
+        fd, self.lockfile = tempfile.mkstemp(prefix='bottle-reloader.')
+        os.close(fd) # The sub-process needs write access.
+        command = [sys.executable] + sys.argv
+        environ = os.environ.copy()
+        environ.update(BOTTLE_CHILD='true', BOTTLE_LOCKFILE=self.lockfile)
+
+        def heartbeat():
+            while os.path.exists(self.lockfile):
+                os.utime(self.lockfile, None)
+                time.sleep(self.interval)
+
+        heartbeat = threading.Thread(target=heartbeat, name='heartbeat')
+        heartbeat.deamon = True
+        heartbeat.start()
+
+        try:
+            while os.path.exists(self.lockfile):
+                open(self.lockfile, 'w').close()
+                status = subprocess.Popen(command, env=environ).wait()
+                with open(self.lockfile) as fp:
+                    if 'reload' in fp.read():
+                        continue
+                if status and not self.quiet:
+                    print "Server process died with status code %d" % status
+                if not self.quiet:
+                    print "Reloading server..."
+        finally:
+            os.unlink(self.lockfile)
+
+    def run_server(self, app):
+        ''' Start the server loop that terminates on module file changes. '''
+        self._stopped = False
+        self.lockfile = os.environ['BOTTLE_LOCKFILE']
+        self.mtimes = dict(self.yield_mtimes())
+
+        def interrupter():
+            ''' Interrupt the main thread if needed. '''
+            while not self._stopped:
+                time.sleep(self.interval)
+                if not os.path.exists(self.lockfile):
+                    break # Observer shutdown (ctrl-c or sigint).
+                if os.stat(self.lockfile).st_mtime < time.time() - self.timeout:
+                    break # Observer died the hard way (sigterm).
+                if self.needs_reload():
+                    with open(self.lockfile, 'w') as fp:
+                        fp.write('reload')
+                    break # We need a restart.
+            if not self._stopped:
+                thread.interrupt_main()
+
+        interrupter = threading.Thread(target=interrupter, name='module_check')
+        interrupter.deamon = True
+        interrupter.start()
+
+        try:
+            WSGIRefServer.run(self, app)
+        finally:
+            self._stopped = True
+
+    def yield_mtimes(self):
+        ''' Yield (path, mtime) tuples for all loaded module files. '''
+        for module in sys.modules.values():
+            path = getattr(module, '__file__', '')
+            if path[-4:] in ('.pyo', '.pyc'): path = path[:-1]
+            if path and os.path.exists(path):
+                yield path, os.stat(path).st_mtime
+    
+    def needs_reload(self):
+        ''' Return True if any module files changed since last run. '''
+        current = dict(self.yield_mtimes())
+        for path, mtime in self.mtimes.iteritems():
+            if path not in current or current[path] > mtime:
+                return True # Deleted or updated files
+        self.mtimes.update(current)
+
+
+
+
+
+
 server_names = {
     'cgi': CGIServer,
     'flup': FlupFCGIServer,
@@ -1977,6 +2095,7 @@ server_names = {
     'rocket': RocketServer,
     'bjoern' : BjoernServer,
     'auto': AutoServer,
+    'reload': ReloadingServer
 }
 
 
@@ -2038,8 +2157,8 @@ def load_app(target):
     return rv if isinstance(rv, Bottle) else tmp
 
 
-def run(app=None, server='wsgiref', host='127.0.0.1', port=8080,
-        interval=1, reloader=False, quiet=False, **kargs):
+def run(app=None, server='wsgiref', host='127.0.0.1', port=8080, reloader=False,
+        quiet=False, **kargs):
     """ Start a server instance. This method blocks until the server terminates.
 
         :param app: WSGI application or target string supported by
@@ -2051,15 +2170,17 @@ def run(app=None, server='wsgiref', host='127.0.0.1', port=8080,
                all interfaces including the external one. (default: 127.0.0.1)
         :param port: Server port to bind to. Values below 1024 require root
                privileges. (default: 8080)
-        :param reloader: Start auto-reloading server? (default: False)
+        :param reloader: Start auto-reloading server. (deprecated, use the
+               'reload' server adapter.)
         :param interval: Auto-reloader interval in seconds (default: 1)
         :param quiet: Suppress output to stdout and stderr? (default: False)
         :param options: Options passed to the server adapter.
-     """
+    """
     app = app or default_app()
     if isinstance(app, basestring):
         app = load_app(app)
     if isinstance(server, basestring):
+        if reloader: server = 'reload'
         server = server_names.get(server)
     if isinstance(server, type):
         server = server(host=host, port=port, **kargs)
@@ -2072,97 +2193,11 @@ def run(app=None, server='wsgiref', host='127.0.0.1', port=8080,
         print "Use Ctrl-C to quit."
         print
     try:
-        if reloader:
-            interval = min(interval, 1)
-            if os.environ.get('BOTTLE_CHILD'):
-                _reloader_child(server, app, interval)
-            else:
-                _reloader_observer(server, app, interval)
-        else:
-            server.run(app)
+        server.run(app)
     except KeyboardInterrupt:
         pass
     if not server.quiet and not os.environ.get('BOTTLE_CHILD'):
         print "Shutting down..."
-
-
-class FileCheckerThread(threading.Thread):
-    ''' Thread that periodically checks for changed module files. '''
-
-    def __init__(self, lockfile, interval):
-        threading.Thread.__init__(self)
-        self.lockfile, self.interval = lockfile, interval
-        #1: lockfile to old; 2: lockfile missing
-        #3: module file changed; 5: external exit
-        self.status = 0
-
-    def run(self):
-        exists = os.path.exists
-        mtime = lambda path: os.stat(path).st_mtime
-        files = dict()
-        for module in sys.modules.values():
-            path = getattr(module, '__file__', '')
-            if path[-4:] in ('.pyo', '.pyc'): path = path[:-1]
-            if path and exists(path): files[path] = mtime(path)
-        while not self.status:
-            for path, lmtime in files.iteritems():
-                if not exists(path) or mtime(path) > lmtime:
-                    self.status = 3
-            if not exists(self.lockfile):
-                self.status = 2
-            elif mtime(self.lockfile) < time.time() - self.interval - 5:
-                self.status = 1
-            if not self.status:
-                time.sleep(self.interval)
-        if self.status != 5:
-            thread.interrupt_main()
-
-
-def _reloader_child(server, app, interval):
-    ''' Start the server and check for modified files in a background thread.
-        As soon as an update is detected, KeyboardInterrupt is thrown in
-        the main thread to exit the server loop. The process exists with status
-        code 3 to request a reload by the observer process. If the lockfile
-        is not modified in 2*interval second or missing, we assume that the
-        observer process died and exit with status code 1 or 2.
-    '''
-    lockfile = os.environ.get('BOTTLE_LOCKFILE')
-    bgcheck = FileCheckerThread(lockfile, interval)
-    try:
-        bgcheck.start()
-        server.run(app)
-    except KeyboardInterrupt:
-        pass
-    bgcheck.status, status = 5, bgcheck.status
-    bgcheck.join() # bgcheck.status == 5 --> silent exit
-    if status: sys.exit(status)
-
-
-def _reloader_observer(server, app, interval):
-    ''' Start a child process with identical commandline arguments and restart
-        it as long as it exists with status code 3. Also create a lockfile and
-        touch it (update mtime) every interval seconds.
-    '''
-    fd, lockfile = tempfile.mkstemp(prefix='bottle-reloader.', suffix='.lock')
-    os.close(fd) # We only need this file to exist. We never write to it
-    try:
-        while os.path.exists(lockfile):
-            args = [sys.executable] + sys.argv
-            environ = os.environ.copy()
-            environ['BOTTLE_CHILD'] = 'true'
-            environ['BOTTLE_LOCKFILE'] = lockfile
-            p = subprocess.Popen(args, env=environ)
-            while p.poll() is None: # Busy wait...
-                os.utime(lockfile, None) # I am alive!
-                time.sleep(interval)
-            if p.poll() != 3:
-                if os.path.exists(lockfile): os.unlink(lockfile)
-                sys.exit(p.poll())
-            elif not server.quiet:
-                print "Reloading server..."
-    except KeyboardInterrupt:
-        pass
-    if os.path.exists(lockfile): os.unlink(lockfile)
 
 
 
