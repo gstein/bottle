@@ -2366,6 +2366,81 @@ class BaseTemplate(object):
         raise NotImplementedError
 
 
+class BaseTemplatePlugin(object):
+    ''' ### docco '''
+
+    api = 2
+
+    def __init__(self, lookup=[], default_vars={}):
+        self.lookup = map(os.path.abspath, lookup)
+        self.default_vars = default_vars
+
+    def setup(self, app):
+        for other in app.plugins:
+            if isinstance(other, BaseTemplatePlugin):
+                raise PluginError('Found another templating plugin '
+                                  'that will conflict.')
+
+    def apply(self, callback, route):
+        if 'view' not in route.config:
+            return callback
+
+        lookup = route.config.get('template_lookup', self.lookup)
+
+        options = route.config.get('template_options', {})
+
+        default_vars = self.default_vars.copy()
+        default_vars.update(route.config.get('template_vars', {}))
+
+        # factory, source, or filename
+        view = route.config['view']
+        is_factory = callable(view)
+        is_source = (("\n" in view) or
+                     ("{" in view) or
+                     ("%" in view) or
+                     ('$' in view) or
+                     ('[' in view))
+        if not is_factory and not is_source:
+            filepath = self.locate_file(view, lookup, **options)
+            if not filepath:
+                raise PluginError('Template (%s) not found' % (view,))
+
+        def get_template():
+            if is_factory:
+                template = view(**options)
+            elif is_source:
+                template = self.prepare(source=view, **options)
+            else:
+                template = self.prepare(filepath=filepath, **options)
+            return template
+        cached_template = get_template()
+
+        @functools.wraps(callback)
+        def wrapper(*args, **kwargs):
+            result = callback(*args, **kwargs)
+            if isinstance(result, (dict, DictMixin)):
+                if DEBUG:
+                    template = get_template()
+                else:
+                    template = cached_template
+                tplvars = default_vars.copy()
+                tplvars.update(result)
+                if is_factory:
+                    return template(tplvars)
+                return self.render(template, tplvars)
+            return result
+
+        return wrapper
+
+    def locate_file(self, filename, lookup, **options):
+        for path in lookup:
+            filepath = os.path.join(path, filename)
+            if os.path.exists(filepath):
+                return filepath
+        ### try various extensions?
+        return None
+
+
 class MakoTemplate(BaseTemplate):
     def prepare(self, **options):
         from mako.template import Template
