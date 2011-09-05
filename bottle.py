@@ -501,7 +501,6 @@ class Bottle(object):
         #: If true, most exceptions are catched and returned as :exc:`HTTPError`
         self.catchall = catchall
         self.config = config or {}
-        self.serve = True
         # Default plugins
         self.hooks = self.install(HooksPlugin())
         if autojson:
@@ -676,9 +675,6 @@ class Bottle(object):
         return self._handle({'PATH_INFO': path, 'REQUEST_METHOD': method.upper()})
 
     def _handle(self, environ):
-        if not self.serve:
-            depr("Bottle.serve will be removed in 0.10.")
-            return HTTPError(503, "Server stopped")
         try:
             route, args = self.match(environ)
             environ['route.handle'] = environ['bottle.route'] = route
@@ -858,12 +854,12 @@ class BaseRequest(DictMixin):
 
     @DictProperty('environ', 'bottle.request.query', read_only=True)
     def query(self):
-        ''' The :attr:`query_string` parsed into a :class:`MultiDict`. These
+        ''' The :attr:`query_string` parsed into a :class:`FormsDict`. These
             values are sometimes called "URL arguments" or "GET parameters", but
             not to be confused with "URL wildcards" as they are provided by the
             :class:`Router`. '''
         data = parse_qs(self.query_string, keep_blank_values=True)
-        get = self.environ['bottle.get'] = MultiDict()
+        get = self.environ['bottle.get'] = FormsDict()
         for key, values in data.iteritems():
             for value in values:
                 get[key] = value
@@ -873,9 +869,9 @@ class BaseRequest(DictMixin):
     def forms(self):
         """ Form values parsed from an `url-encoded` or `multipart/form-data`
             encoded POST or PUT request body. The result is retuned as a
-            :class:`MultiDict`. All keys and values are strings. File uploads
+            :class:`FormsDict`. All keys and values are strings. File uploads
             are stored separately in :attr:`files`. """
-        forms = MultiDict()
+        forms = FormsDict()
         for name, item in self.POST.iterallitems():
             if not hasattr(item, 'filename'):
                 forms[name] = item
@@ -883,9 +879,9 @@ class BaseRequest(DictMixin):
 
     @DictProperty('environ', 'bottle.request.params', read_only=True)
     def params(self):
-        """ A :class:`MultiDict` with the combined values of :attr:`query` and
+        """ A :class:`FormsDict` with the combined values of :attr:`query` and
             :attr:`forms`. File uploads are stored in :attr:`files`. """
-        params = MultiDict()
+        params = FormsDict()
         for key, value in self.query.iterallitems():
             params[key] = value
         for key, value in self.forms.iterallitems():
@@ -909,7 +905,7 @@ class BaseRequest(DictMixin):
                 reads the file every time you request the value. Do not do this
                 on big files.
         """
-        files = MultiDict()
+        files = FormsDict()
         for name, item in self.POST.iterallitems():
             if hasattr(item, 'filename'):
                 files[name] = item
@@ -956,10 +952,10 @@ class BaseRequest(DictMixin):
     @DictProperty('environ', 'bottle.request.post', read_only=True)
     def POST(self):
         """ The values of :attr:`forms` and :attr:`files` combined into a single
-            :class:`MultiDict`. Values are either strings (form values) or
+            :class:`FormsDict`. Values are either strings (form values) or
             instances of :class:`cgi.FieldStorage` (file uploads).
         """
-        post = MultiDict()
+        post = FormsDict()
         safe_env = {'QUERY_STRING':''} # Build a safe environment for cgi
         for key in ('REQUEST_METHOD', 'CONTENT_TYPE', 'CONTENT_LENGTH'):
             if key in self.environ: safe_env[key] = self.environ[key]
@@ -1114,6 +1110,8 @@ class BaseRequest(DictMixin):
         for key in todelete:
             self.environ.pop('bottle.request.'+key, None)
 
+    def __repr__(self):
+        return '<%s: %s %s>' % (self.__class__.__name__, self.method, self.url)
 
 def _hkey(s):
     return s.title().replace('_','-')
@@ -1149,8 +1147,8 @@ class BaseResponse(object):
     default_status = 200
     default_content_type = 'text/html; charset=UTF-8'
 
-    #: Header blacklist for specific response codes
-    #: (rfc2616 section 10.2.3 and 10.3.5)
+    # Header blacklist for specific response codes
+    # (rfc2616 section 10.2.3 and 10.3.5)
     bad_headers = {
         204: set(('Content-Type',)),
         304: set(('Allow', 'Content-Encoding', 'Content-Language',
@@ -1159,10 +1157,10 @@ class BaseResponse(object):
 
     def __init__(self, body='', status=None, **headers):
         #: The HTTP status code as an integer (e.g. 404).
-        #: Do not change it directly, see :attr:`status`.
+        #: Do not change the value manually, use :attr:`status` instead.
         self.status_code = None
         #: The HTTP status line as a string (e.g. "404 Not Found").
-        #: Do not change it directly, see :attr:`status`.
+        #: Do not change the value manually, use :attr:`status` instead.
         self.status_line = None
         #: The response body as one of the supported data types.
         self.body = body
@@ -1203,7 +1201,7 @@ class BaseResponse(object):
         ''' A writeable property to change the HTTP response status. It accepts
             either a numeric code (100-999) or a string with a custom reason
             phrase (e.g. "404 Brain not found"). Both :data:`status_line` and
-            :data:`status_line` are updates accordingly. The return value is
+            :data:`status_code` are updates accordingly. The return value is
             always a numeric code. ''')
     del _set_status
 
@@ -1354,9 +1352,11 @@ Request  = LocalRequest  # BC 0.9
 # Plugins ######################################################################
 ###############################################################################
 
+class PluginError(BottleException): pass
 
 class JSONPlugin(object):
     name = 'json'
+    api  = 2
 
     def __init__(self, json_dumps=json_dumps):
         self.json_dumps = json_dumps
@@ -1378,6 +1378,7 @@ class JSONPlugin(object):
 
 class HooksPlugin(object):
     name = 'hooks'
+    api  = 2
 
     def __init__(self):
         self.hooks = {'before_request': [], 'after_request': []}
@@ -1423,14 +1424,15 @@ class TemplatePlugin(object):
         element must be a dict with additional options (e.g. `template_engine`)
         or default variables for the template. '''
     name = 'template'
+    api  = 2
 
-    def apply(self, callback, context):
-        conf = context['config'].get('template')
+    def apply(self, callback, route):
+        conf = route.config.get('template')
         if isinstance(conf, (tuple, list)) and len(conf) == 2:
             return view(conf[0], **conf[1])(callback)
-        elif isinstance(conf, str) and 'template_opts' in context['config']:
+        elif isinstance(conf, str) and 'template_opts' in route.config:
             depr('The `template_opts` parameter is deprecated.') #0.9
-            return view(conf, **context['config']['template_opts'])(callback)
+            return view(conf, **route.config['template_opts'])(callback)
         elif isinstance(conf, str):
             return view(conf)(callback)
         else:
@@ -1502,11 +1504,21 @@ class MultiDict(DictMixin):
     items    = iteritems    if py3k else lambda self: list(self.iteritems())
     allitems = iterallitems if py3k else lambda self: list(self.iterallitems())
 
-    def get(self, key, default=None, index=-1):
-        ''' Return the current value for a key. The third `index` parameter
-            defaults to -1 (last value). '''
-        if key in self.dict or default is KeyError:
-            return self.dict[key][index]
+    def get(self, key, default=None, index=-1, type=None):
+        ''' Return the most recent value for a key.
+
+            :param default: The default value to be returned if the key is not
+                   present or the type conversion fails.
+            :param index: An index for the list of available values.
+            :param type: If defined, this callable is used to cast the value
+                    into a specific type. Exception are suppressed and result in
+                    the default value to be returned.
+        '''
+        try:
+            val = self.dict[key][index]
+            return type(val) if type else val
+        except Exception, e:
+            pass
         return default
 
     #: Alias for :meth:`get` to mimic other multi-dict APIs (Django)
@@ -1524,6 +1536,11 @@ class MultiDict(DictMixin):
         ''' Return a (possibly empty) list of values for a key. '''
         return self.dict.get(key) or []
 
+class FormsDict(MultiDict):
+    ''' A :class:`MultiDict` with attribute-like access to form values.
+        Missing attributes are always `None`. '''
+    def __getattr__(self, name):
+        return self.get(name, None)
 
 class HeaderDict(MultiDict):
     """ A case-insensitive version of :class:`MultiDict` that defaults to
@@ -1593,8 +1610,8 @@ class WSGIHeaderDict(DictMixin):
             elif key in self.cgikeys:
                 yield key.replace('_', '-').title()
 
-    def keys(self): return list(self)
-    def __len__(self): return len(list(self))
+    def keys(self): return [x for x in self]
+    def __len__(self): return len(self.keys())
     def __contains__(self, key): return self._ekey(key) in self.environ
 
 
@@ -1642,12 +1659,11 @@ def abort(code=500, text='Unknown Error: Application stopped.'):
     raise HTTPError(code, text)
 
 
-def redirect(url, code=303):
+def redirect(url, code=None):
     """ Aborts execution and causes a 303 or 302 redirect, depending on
-        the HTTP protocol version.
-    """
-    if request['SERVER_PROTOCOL'] == "HTTP/1.0":
-        code=302
+        the HTTP protocol version. """
+    if code is None:
+        code = 303 if request.get('SERVER_PROTOCOL') == "HTTP/1.1" else 302
     location = urljoin(request.url, url)
     raise HTTPResponse("", status=code, header=dict(Location=location))
 
@@ -1759,6 +1775,18 @@ def cookie_decode(data, key):
 def cookie_is_encoded(data):
     ''' Return True if the argument looks like a encoded cookie.'''
     return bool(data.startswith(tob('!')) and tob('?') in data)
+
+
+def html_escape(string):
+    ''' Escape HTML special characters ``&<>`` and quotes ``'"``. '''
+    return string.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')\
+                 .replace('"','&quot;').replace("'",'&#039;')
+
+
+def html_quote(string):
+    ''' Escape and quote a string to be used as an HTTP attribute.'''
+    return '"%s"' % html_escape(string).replace('\n','%#10;')\
+                    .replace('\r','&#13;').replace('\t','&#9;')
 
 
 def yieldroutes(func):
@@ -2269,7 +2297,7 @@ class TemplateError(HTTPError):
 
 class BaseTemplate(object):
     """ Base class and minimal API for template adapters """
-    extentions = ['tpl','html','thtml','stpl']
+    extensions = ['tpl','html','thtml','stpl']
     settings = {} #used in prepare()
     defaults = {} #used in render()
 
@@ -2308,7 +2336,7 @@ class BaseTemplate(object):
             fname = os.path.join(spath, name)
             if os.path.isfile(fname):
                 return fname
-            for ext in cls.extentions:
+            for ext in cls.extensions:
                 if os.path.isfile('%s.%s' % (fname, ext)):
                     return '%s.%s' % (fname, ext)
 
@@ -2316,6 +2344,7 @@ class BaseTemplate(object):
     def global_config(cls, key, *args):
         ''' This reads or sets the global settings stored in class.settings. '''
         if args:
+            cls.settings = cls.settings.copy() # Make settings local to class
             cls.settings[key] = args[0]
         else:
             return cls.settings[key]
@@ -2472,7 +2501,7 @@ class SimpleTemplate(BaseTemplate):
              |\#.*                        # Comments
             )''', re.VERBOSE)
 
-    def prepare(self, escape_func=cgi.escape, noescape=False):
+    def prepare(self, escape_func=html_escape, noescape=False, **kwargs):
         self.cache = {}
         enc = self.encoding
         self._str = lambda x: touni(x, enc)
