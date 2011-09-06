@@ -23,9 +23,9 @@ class EZTPlugin(bottle.BaseTemplatePlugin):
 
     name = 'ezt'
 
-    def __init__(self, lookup=['.'], default_vars={},
+    def __init__(self, lookup=['.'], options={}, default_vars={},
                  compress_whitespace=True, base_format=ezt.FORMAT_HTML):
-        bottle.BaseTemplatePlugin.__init__(self, lookup, default_vars)
+        bottle.BaseTemplatePlugin.__init__(self, lookup, options, default_vars)
         self.compress_whitespace = compress_whitespace
         self.base_format = base_format
 

@@ -2371,8 +2371,9 @@ class BaseTemplatePlugin(object):
 
     api = 2
 
-    def __init__(self, lookup=[], default_vars={}):
+    def __init__(self, lookup=['.'], options={}, default_vars={}):
         self.lookup = map(os.path.abspath, lookup)
+        self.options = options
         self.default_vars = default_vars
 
     def setup(self, app):
@@ -2387,7 +2388,7 @@ class BaseTemplatePlugin(object):
 
         lookup = route.config.get('template_lookup', self.lookup)
 
-        options = route.config.get('template_options', {})
+        options = route.config.get('template_options', self.options)
 
         default_vars = self.default_vars.copy()
         default_vars.update(route.config.get('template_vars', {}))
